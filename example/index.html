@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>FortressFlag Web SDK — example</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        max-width: 720px;
+        margin: 2rem auto;
+        padding: 0 1rem;
+        color: #1a1a2e;
+      }
+      h1 {
+        font-size: 1.3rem;
+      }
+      table {
+        border-collapse: collapse;
+        width: 100%;
+        margin: 1rem 0;
+      }
+      th,
+      td {
+        text-align: left;
+        padding: 0.4rem 0.6rem;
+        border-bottom: 1px solid #ddd;
+        font-variant-numeric: tabular-nums;
+      }
+      .source-fresh {
+        color: #0a7d33;
+      }
+      .source-cached {
+        color: #a86a00;
+      }
+      .source-safeDefault,
+      .source-developerDefault {
+        color: #777;
+      }
+      #diagnostics {
+        background: #f5f5fa;
+        padding: 0.8rem 1rem;
+        border-radius: 8px;
+        font-size: 0.9rem;
+      }
+      #diagnostics dt {
+        font-weight: 600;
+      }
+      button {
+        padding: 0.5rem 1rem;
+        font-size: 1rem;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>FortressFlag Web SDK — example page</h1>
+    <p>
+      Talks to the local backend at <code>http://localhost:8080</code> with the committed dev seed
+      key. Flags render with provenance; the SDK polls every 30&nbsp;s.
+    </p>
+    <button id="refresh">Refresh now</button>
+    <table>
+      <thead>
+        <tr>
+          <th>Flag</th>
+          <th>Value</th>
+          <th>Provenance</th>
+        </tr>
+      </thead>
+      <tbody id="flags">
+        <tr>
+          <td colspan="3">(no flags yet — the cascade answers <code>false</code>)</td>
+        </tr>
+      </tbody>
+    </table>
+    <dl id="diagnostics"></dl>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

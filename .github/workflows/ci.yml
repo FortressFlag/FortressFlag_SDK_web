@@ -1,0 +1,167 @@
+# Continuous integration for the web client SDK.
+#
+# This workflow IS the merge gate described in Founding CLAUDE.md §7.5 and §9. It matters more
+# here than almost anywhere else: we cannot recall a shipped SDK, so anything that gets past
+# this gate lives in customers' pages until they rebuild and redeploy on their own schedule.
+#
+# NOTE for whoever adds the branch ruleset: add these four job names as required checks *after*
+# this file lands on `development` (docs/compliance/change-management.md in
+# FortressFlag_Backend). Requiring a check that has never reported blocks every merge
+# permanently.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [development]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Build, lint, types & unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Corepack activates the pnpm version pinned in package.json's `packageManager` field, so
+      # the resolver here is byte-identical to the one on a contributor's laptop. This must run
+      # before setup-node's pnpm cache, which needs a working pnpm to locate the store.
+      - name: Enable Corepack
+        run: corepack enable
+
+      - uses: actions/setup-node@v7
+        with:
+          # .nvmrc is the single source of truth for the toolchain version — never a literal
+          # here that can drift from what developers run.
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      # --frozen-lockfile fails rather than silently resolving a different tree than the
+      # lockfile describes. An unreviewed dependency is a supply-chain change (CLAUDE.md).
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Build includes the 10 kB gzip size gate (scripts/size-gate.mjs, ADR-0014): the ceiling
+      # is enforced on every PR, not discovered on a customer's page.
+      - name: Build (tsc + size gate)
+        run: pnpm build
+
+      - name: Lint (prettier + eslint)
+        run: pnpm lint
+
+      - name: Unit tests
+        run: pnpm test
+
+  crash-primitives:
+    name: No crash primitives in library sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Grep for crash primitives
+        # Deliberately a dumb grep, and deliberately separate from ESLint. The lint config is
+        # one pull request away from being relaxed with a plausible-looking justification;
+        # this is harder to weaken quietly, and a reviewer seeing it removed knows exactly
+        # what it meant.
+        #
+        # A non-null assertion is TypeScript's `try!`: a null that fires inside our code
+        # breaks the customer's page, and no amount of error handling above it helps
+        # (Founding §8.1). `any` is the hole every trap crawls through — it silences the
+        # compiler exactly at the boundary with a server we treat as hostile. Type-position
+        # forms only: a bare `\bany\b` would match the word in comments and cry wolf.
+        run: |
+          if grep -rnE ': any|<any>|as any|@ts-ignore|@ts-expect-error|[a-zA-Z0-9_)\]]!\.' src/; then
+            echo "::error::Crash primitives found in src/. The SDK must never trap inside a customer's page."
+            exit 1
+          fi
+          echo "No crash primitives in library sources."
+
+  browser-tests:
+    name: Storage & identity tests (browser)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install chromium
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Browser tests (real localStorage, real chromium)
+        # The analogue of the mobile SDKs' simulator/emulator jobs: identity and cache tests
+        # run against the REAL browser storage, not jsdom's polite fake — quota behaviour,
+        # the cross-tab `storage` event, and private-mode throwing do not exist in a polyfill,
+        # and a stub would test our idea of the browser.
+        run: pnpm test:browser
+
+  security:
+    name: Security scanning
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # gitleaks needs history to scan commits, not just the working tree.
+          fetch-depth: 0
+
+      - name: gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          # SHA-256 of gitleaks_8.30.1_linux_x64.tar.gz, from the release's published
+          # checksums.txt. Pinning the version alone still trusts whatever bytes that URL
+          # serves on the day CI runs; this is what makes the download reproducible. Bump both
+          # lines together — a version bumped without its checksum fails loudly here, which is
+          # intended.
+          #
+          # Deliberately NOT gitleaks/gitleaks-action@v2. That action requires a paid licence
+          # for organisation-owned repositories, so it simply fails here — and a floating @v2
+          # tag in the job whose entire subject is supply-chain hygiene is the wrong shape
+          # anyway. This matches the backend, iOS and Android security jobs exactly.
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          # pipefail matters: without it a curl that dies mid-stream is masked by a tar that
+          # happens to succeed on the truncated prefix.
+          set -euo pipefail
+          curl -sSfL -o "$RUNNER_TEMP/gitleaks.tar.gz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/gitleaks.tar.gz" | sha256sum --check --strict -
+          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP" gitleaks
+          # Unpacked outside the checkout so the scanner never sees its own artefacts.
+          "$RUNNER_TEMP/gitleaks" git . --redact --no-banner
+
+      - name: No checked-in signing keys
+        # A private key appearing in this repo would mean someone made signing convenient,
+        # which is how signing stops being worth anything.
+        run: |
+          if grep -rlE 'BEGIN (RSA |EC |OPENSSH |PGP )?PRIVATE KEY' . --exclude-dir=.git; then
+            echo "::error::A private key is checked into this repository."
+            exit 1
+          fi
+          echo "No private keys checked in."
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+
+      - name: Dependency audit
+        # Trivially green while `dependencies` is empty (ADR-0014) — it exists to catch the
+        # day that stops being true, loudly and in the security job where it belongs.
+        run: pnpm audit --prod
