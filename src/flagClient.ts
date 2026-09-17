@@ -1,4 +1,4 @@
-import type { ResolvedConfiguration } from "./configuration.js";
+import { SIGNATURE_DISABLED, type ResolvedConfiguration } from "./configuration.js";
 import type { EnvelopeCache } from "./cache/envelopeCache.js";
 import { changedKeys as computeChangedKeys } from "./evaluation/resolver.js";
 import type { IdentitySource } from "./identity/deviceIdentityStore.js";
@@ -10,6 +10,7 @@ import { encodeTags, sanitizeTags } from "./tags/tags.js";
 import { Backoff, SYSTEM_RANDOM, type RandomInRange } from "./transport/backoff.js";
 import type { ClientApi } from "./transport/clientApi.js";
 import type { TransportFailure } from "./transport/clientApi.js";
+import type { FlagValue } from "./flagValue.js";
 import { verifyEnvelope, type Expectations } from "./transport/envelopeVerifier.js";
 
 export interface FlagClientDeps {
@@ -45,6 +46,12 @@ export class FlagClient {
   private readonly notify: (changed: ReadonlySet<string>) => void;
 
   private etag: string | null = null;
+  /** The in-progress cache restore; every refresh awaits it before fetching (see restoreCache). */
+  private restore: Promise<void> | null = null;
+  /** Bumped by setTags and resetIdentity: a restore that began before either must not
+   * publish stale values or a stale validator after it. */
+  private generation = 0;
+  private unverifiableLogged = false;
   private inFlight: Promise<RefreshOutcome> | null = null;
   private pollTimer: ReturnType<typeof setTimeout> | null = null;
   private stopped = false;
@@ -72,12 +79,13 @@ export class FlagClient {
   // --- lifecycle -----------------------------------------------------------------------
 
   /**
-   * Begins polling. [restoredEtag] comes from the synchronous cache load the facade already
-   * performed — see [loadCacheIntoStore]. The identity resolves here (it may mint), and the
-   * first poll fires immediately.
+   * Kicks the cache restore and begins polling. Synchronous and `void`: the restore is
+   * asynchronous (WebCrypto verifies asynchronously) and the first poll awaits it, so the
+   * cached values are always applied before any network result — see [restoreCache].
+   * The identity resolves here (it may mint).
    */
-  start(restoredEtag: string | null): void {
-    this.etag = restoredEtag;
+  start(): void {
+    this.restoreCache();
     this.publishTagKeys();
     const deviceId = this.identity.identity();
     if (deviceId !== null) {
@@ -98,6 +106,7 @@ export class FlagClient {
   resetIdentity(): void {
     this.identity.reset();
     this.cache.clear();
+    this.generation += 1;
     this.etag = null;
     this.consecutiveFailures = 0;
     this.store.update((s) => ({ ...s, fresh: null, cached: null, deviceId: null }));
@@ -118,6 +127,7 @@ export class FlagClient {
       // stored validator no longer names what the next response would be — in memory AND
       // in the durable cache, or a page reload would resurrect the stale validator.
       this.etag = null;
+      this.generation += 1;
       this.cache.clearEtag();
     }
     this.encodedTags = encoded;
@@ -168,6 +178,11 @@ export class FlagClient {
     }
     this.store.update((s) => ({ ...s, deviceId }));
 
+    // The cache lands before any network result can: a 200 applied first would be
+    // overwritten by the older cached values a moment later. Also carries the stored ETag
+    // into this very fetch.
+    if (this.restore !== null) await this.restore;
+
     const outcome = await this.api.fetchFlags(deviceId, this.etag, this.encodedTags);
     switch (outcome.type) {
       case "notModified": {
@@ -199,17 +214,19 @@ export class FlagClient {
    * who can serve responses cannot erase what the browser already knows — they can only
    * fail to change it.
    */
-  private accept(raw: Uint8Array, responseEtag: string | null, deviceId: string): RefreshOutcome {
+  private async accept(
+    raw: Uint8Array,
+    responseEtag: string | null,
+    deviceId: string,
+  ): Promise<RefreshOutcome> {
     const expectations: Expectations = {
       environment: this.configuration.environment,
       deviceId,
       nowMillis: this.now(),
     };
-    const result = verifyEnvelope(raw, this.configuration.signaturePolicy, expectations);
+    const result = await verifyEnvelope(raw, this.configuration.signaturePolicy, expectations);
     if (!result.accepted) {
-      this.log.error(
-        `rejected a flag payload: ${result.rejection.code}. Serving the last known values.`,
-      );
+      this.logRejection(result.rejection.code);
       this.recordFailure(null);
       return { type: "failed", failure: "rejectedPayload" };
     }
@@ -243,20 +260,44 @@ export class FlagClient {
     return { type: "updated", changedKeys: changed };
   }
 
+  /**
+   * `signatureUnverifiable` is a fact about this browser, not this payload: said once at
+   * error, not on every poll. Every other rejection is a verdict on the bytes and is logged
+   * each time.
+   */
+  private logRejection(code: string): void {
+    if (code !== "signatureUnverifiable") {
+      this.log.error(`rejected a flag payload: ${code}. Serving the last known values.`);
+      return;
+    }
+    if (this.unverifiableLogged) return;
+    this.unverifiableLogged = true;
+    this.log.error(
+      "this browser cannot verify payload signatures (no WebCrypto Ed25519). " +
+        "Serving cached values and defaults.",
+    );
+  }
+
   // --- cache ---------------------------------------------------------------------------
 
   /**
-   * Reads the durable cache and publishes it, returning the stored ETag. Synchronous on
-   * purpose: it runs during [FortressFlag.start], before that call returns, so that an
-   * `isEnabled` on the very next line of the host page already sees the last values this
-   * browser had (`localStorage` is synchronous, which makes this trivially natural here —
-   * the test pins it anyway). Deferring it would mean every cold load briefly answers
-   * `false` for every flag — a visible flicker of un-launched features, precisely what the
-   * durable cache exists to prevent (Founding §8.4).
+   * Reads the durable cache, verifies it, and publishes it. The read is synchronous
+   * (`localStorage`), the verification is not (WebCrypto), so the values land a moment
+   * after [start] returns rather than before it; the promise is stored so every refresh
+   * awaits it and no network result can race the restore. Listeners are notified of the
+   * restored keys, because a page that rendered defaults in that moment has to learn the
+   * cached values arrived — the first fetch will not tell it (cached and fresh then agree).
    */
-  loadCacheIntoStore(): string | null {
+  restoreCache(): Promise<void> {
+    const restore = this.doRestoreCache().catch(() => undefined);
+    this.restore = restore;
+    return restore;
+  }
+
+  private async doRestoreCache(): Promise<void> {
     const cached = this.cache.load();
-    if (cached === null) return null;
+    if (cached === null) return;
+    const generation = this.generation;
 
     // The identity may not be resolvable yet; the verifier skips the device check when
     // null rather than discarding the fallback — see Expectations.deviceId.
@@ -276,19 +317,46 @@ export class FlagClient {
       enforceExpiry: false,
     };
 
-    const result = verifyEnvelope(cached.raw, this.configuration.signaturePolicy, expectations);
-    if (result.accepted) {
-      const flags = result.envelope.payload.flags;
-      this.store.update((s) => ({ ...s, cached: flags }));
-      this.log.debug(`restored ${flags.size} cached flag value(s)`);
-      return cached.etag;
+    const result = await verifyEnvelope(
+      cached.raw,
+      this.configuration.signaturePolicy,
+      expectations,
+    );
+    if (!result.accepted && result.rejection.code !== "signatureUnverifiable") {
+      // A cache that fails verification is a cache we cannot use. Removing it stops us
+      // re-reading and re-rejecting the same bytes on every load, and a failing entry is
+      // exactly what a poisoning attempt looks like.
+      this.log.warning(`discarding an unverifiable flag cache: ${result.rejection.code}`);
+      this.cache.clear();
+      return;
     }
-    // A cache we cannot verify is a cache we cannot use. Removing it stops us re-reading
-    // and re-rejecting the same bytes on every load, and an unverifiable entry is exactly
-    // what a poisoning attempt looks like.
-    this.log.warning(`discarding an unverifiable flag cache: ${result.rejection.code}`);
-    this.cache.clear();
-    return null;
+    let flags: ReadonlyMap<string, FlagValue>;
+    if (result.accepted) {
+      flags = result.envelope.payload.flags;
+    } else {
+      // This browser cannot run the check at all. The entry was verified by this SDK when
+      // it was written and sits in this origin's own storage, so it is kept AND served:
+      // clearing it would turn a platform limitation into the §8.4 regression.
+      this.logRejection(result.rejection.code);
+      const unsigned = await verifyEnvelope(cached.raw, SIGNATURE_DISABLED, expectations);
+      if (!unsigned.accepted) {
+        this.log.warning(`discarding an unverifiable flag cache: ${unsigned.rejection.code}`);
+        this.cache.clear();
+        return;
+      }
+      flags = unsigned.envelope.payload.flags;
+    }
+    // A reset or tag change during the verification made this entry stale; drop it.
+    if (generation !== this.generation) return;
+    this.store.update((s) => ({ ...s, cached: flags }));
+    if (this.etag === null) this.etag = cached.etag;
+    this.log.debug(`restored ${flags.size} cached flag value(s)`);
+    if (flags.size === 0) return;
+    try {
+      this.notify(new Set(flags.keys()));
+    } catch {
+      // A hostile or buggy change handler must not fail the restore — or reach the page.
+    }
   }
 
   // --- polling -------------------------------------------------------------------------

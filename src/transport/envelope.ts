@@ -30,9 +30,8 @@ export interface SignedEnvelope {
   /** Unpadded base64url of the payload JSON. */
   readonly payload: string;
   /**
-   * `ed25519:<keyID>:<unpadded base64url signature>`. Absent only when the server is not
-   * signing (true of every real response until backend M4), which a `required` policy
-   * rejects.
+   * `ed25519:<keyID>:<unpadded base64url signature>`. Absent only from a local development
+   * backend running without signing keys, which a `required` policy rejects.
    */
   readonly sig: string | null;
 }

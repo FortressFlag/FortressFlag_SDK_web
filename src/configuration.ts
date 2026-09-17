@@ -64,15 +64,26 @@ export class TrustedKeys {
   }
 
   /**
-   * The keys FortressFlag signs production payloads with.
-   *
-   * Empty until the backend's signing service (roadmap M4) exists — its algorithm ADR is
-   * also what decides the verification primitive here, which is why this SDK ships the
-   * policy and the envelope plumbing but no crypto (backend ADR-0013/0014). Empty means a
-   * `required` policy rejects everything, which is the correct fail-closed behaviour for an
-   * unverifiable payload — during local development use `disabled` explicitly.
+   * The keys FortressFlag signs production payloads with (backend ADR-0025), raw 32-byte
+   * Ed25519 public keys by key ID. Rotation adds key N+1 here one release before the backend
+   * switches to it; the retired key leaves one release later. The same keys are published
+   * in the customer docs (`concepts/payload-signing`) and ADR-0025. Production only: a
+   * build that targets staging passes the staging key explicitly.
    */
-  static readonly FORTRESSFLAG_PRODUCTION = new TrustedKeys(new Map());
+  static readonly FORTRESSFLAG_PRODUCTION = new TrustedKeys({
+    // prod-2026-09-k1 — base64url EaEF8MHNu3onHxemTg3-OcrKrq7ODsZIVEp-IVV2ojg (ADR-0025, minted 2026-09-16)
+    "prod-2026-09-k1": hexToBytes(
+      "11a105f0c1cdbb7a271f17a64e0dfe39cacaaeaece0ec648544a7e215576a238",
+    ),
+  });
+}
+
+function hexToBytes(hex: string): Uint8Array {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = parseInt(hex.substring(i * 2, i * 2 + 2), 16);
+  }
+  return bytes;
 }
 
 /**
@@ -82,7 +93,7 @@ export class TrustedKeys {
  * not in most systems: rejection means "serve the last value this browser saw", not "break
  * the page" (Founding §8.4) — so there is no availability argument for verifying loosely.
  * `disabled` accepts unsigned payloads — intended for local development against a backend
- * that does not hold signing keys yet. A named, greppable choice rather than a silent
+ * running without `FF_SIGNING_*`. A named, greppable choice rather than a silent
  * fallback so that "why is this not verifying?" always has an answer in the customer's own
  * source.
  */

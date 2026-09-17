@@ -84,15 +84,38 @@ afterEach(() => {
   FortressFlag.stop();
 });
 
-describe("FortressFlag — synchronous cache load", () => {
-  it("start returns with the cache already readable — pinned even though localStorage makes it natural", () => {
+describe("FortressFlag — cache restore", () => {
+  it("the cache is readable once the restore lands, and start is marked immediately", async () => {
     const cache = new MemoryCache({ raw: envelopeBytes(), etag: '"e1"' });
     startWith(new ScriptedApi([{ type: "notModified" }]), cache);
-    // No await: the very next line after start() must see the last recorded values.
+    expect(FortressFlag.diagnostics.isStarted).toBe(true);
+    // Verification is asynchronous (WebCrypto), so the values land after start() returns —
+    // but before any refresh resolves, because every refresh awaits the restore.
+    await FortressFlag.refresh();
     const resolution = FortressFlag.resolve("dark-mode");
     expect(resolution.value).toEqual({ kind: "boolean", value: true });
     expect(resolution.source).toBe("cached");
-    expect(FortressFlag.diagnostics.isStarted).toBe(true);
+  });
+
+  it("the restore lands BEFORE any network result, and listeners hear both", async () => {
+    // Trap: a 200 applied before the restore would be overwritten by older cached values.
+    const cache = new MemoryCache({ raw: envelopeBytes(), etag: '"e1"' });
+    const fresher = success(payloadJson({ flagsJson: `{"dark-mode":false,"beta":false}` }), '"e2"');
+    const heard: string[][] = [];
+    startWith(new ScriptedApi([fresher]), cache);
+    const off = FortressFlag.onChange((changed) => heard.push([...changed].sort()));
+    const outcome = await FortressFlag.refresh();
+    off();
+    expect(outcome).toEqual({ type: "updated", changedKeys: new Set(["dark-mode"]) });
+    const resolution = FortressFlag.resolve("dark-mode");
+    expect(resolution.value).toEqual({ kind: "boolean", value: false });
+    expect(resolution.source).toBe("fresh");
+    // Both tiers now hold the network value; the restore did not win the race.
+    expect(FortressFlag.allFlags().get("dark-mode")?.value).toEqual({
+      kind: "boolean",
+      value: false,
+    });
+    expect(heard).toEqual([["beta", "dark-mode"], ["dark-mode"]]);
   });
 
   it("sends the restored ETag on the first fetch", async () => {
@@ -166,7 +189,9 @@ describe("FortressFlag — refresh", () => {
     startWith(api);
     const a = FortressFlag.refresh();
     const b = FortressFlag.refresh();
-    resolveFetch?.({ type: "notModified" });
+    // The fetch is issued only after the (async) cache restore; wait for it.
+    while (resolveFetch === null) await new Promise((r) => setTimeout(r, 0));
+    resolveFetch({ type: "notModified" });
     expect((await a).type).toBe("unchanged");
     expect((await b).type).toBe("unchanged");
     expect(calls).toBe(1);
@@ -233,6 +258,7 @@ describe("FortressFlag — lifecycle", () => {
   it("resetIdentity clears identity, cache and values", async () => {
     const cache = new MemoryCache({ raw: envelopeBytes(), etag: '"e1"' });
     startWith(new ScriptedApi([{ type: "notModified" }]), cache);
+    await FortressFlag.refresh();
     expect(FortressFlag.resolve("dark-mode").source).toBe("cached");
     FortressFlag.resetIdentity();
     expect(cache.contents).toBeNull();

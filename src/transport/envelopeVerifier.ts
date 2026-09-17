@@ -22,6 +22,13 @@ export interface EnvelopeRejection {
     | "unsupportedSignatureAlgorithm"
     | "unknownKeyId"
     | "badSignature"
+    /**
+     * This browser cannot verify signatures at all: `crypto.subtle` is absent (an insecure
+     * non-localhost origin) or has no Ed25519 (Safari < 17, Chrome < 137, Firefox < 130).
+     * Not a verdict on the payload — cache and defaults keep serving, and the client logs
+     * it once at error. Never `badSignature`, which would clear a good cache.
+     */
+    | "signatureUnverifiable"
     | "malformedPayload"
     | "unsupportedContractVersion"
     | "environmentMismatch"
@@ -79,11 +86,16 @@ export type VerifyResult =
 
 const DEFAULT_CLOCK_SKEW_SECONDS = 300;
 
-export function verifyEnvelope(
+/**
+ * Async because WebCrypto is: under `required` the Ed25519 check awaits `crypto.subtle`;
+ * under `disabled` it resolves without a crypto call. One function for both so no caller can
+ * pick a synchronous path that skips verification. Never rejects.
+ */
+export async function verifyEnvelope(
   raw: Uint8Array,
   policy: SignaturePolicy,
   expectations: Expectations,
-): VerifyResult {
+): Promise<VerifyResult> {
   const envelope = parseEnvelope(raw);
   if (envelope === null) {
     return { accepted: false, rejection: { code: "malformedEnvelope" } };
@@ -94,7 +106,7 @@ export function verifyEnvelope(
   }
 
   if (policy.type === "required") {
-    const rejection = checkSignature(envelope.sig, policy.trustedKeys);
+    const rejection = await checkSignature(envelope.sig, payloadBytes, policy.trustedKeys);
     if (rejection !== null) return { accepted: false, rejection };
   }
 
@@ -109,21 +121,24 @@ export function verifyEnvelope(
   return { accepted: true, envelope: { raw, payload } };
 }
 
+const ED25519_PUBLIC_KEY_BYTES = 32;
+
 /**
- * The signature *plumbing*, with the crypto primitive deliberately absent (backend
- * ADR-0013/0014): the backend's signing milestone (M4) has not shipped and its algorithm ADR
- * (P-256 vs Ed25519ph) is open. So: a missing signature under `required` is rejected (fail
- * closed — the iOS behaviour, byte for byte), the `algorithm:keyID:signature` splitting and
- * trust-store lookup are real, and a signature that *survives* those checks is still
- * rejected as `badSignature` because no primitive exists to accept it. When M4 lands, its
- * ADR decides the primitive and this is where it goes — with a real trust store, this stub
- * can reject valid payloads but can never accept a forged one.
+ * Pure Ed25519 over the exact payload bytes (backend ADR-0025), via WebCrypto — the same
+ * verdict the iOS CryptoKit verifier gives, byte for byte. Fail closed: a missing signature
+ * under `required` is `missingSignature`; only a platform that cannot run the check at all
+ * is `signatureUnverifiable`.
  */
-function checkSignature(sig: string | null, trustedKeys: TrustedKeys): EnvelopeRejection | null {
+async function checkSignature(
+  sig: string | null,
+  payloadBytes: Uint8Array,
+  trustedKeys: TrustedKeys,
+): Promise<EnvelopeRejection | null> {
   if (sig === null) return { code: "missingSignature" };
 
-  // Split at the first two colons so a key ID may contain a colon later without a breaking
-  // parse change — found by index, never split(sep, limit), which truncates in JS.
+  // Split at the first two colons: the key ID can never contain one (contract §Signing keys;
+  // the backend refuses such an id), so anything after the second colon is the signature —
+  // found by index, never split(sep, limit), which truncates in JS.
   const first = sig.indexOf(":");
   const second = first < 0 ? -1 : sig.indexOf(":", first + 1);
   if (first < 0 || second < 0) return { code: "malformedSignature" };
@@ -134,16 +149,39 @@ function checkSignature(sig: string | null, trustedKeys: TrustedKeys): EnvelopeR
   if (algorithm !== "ed25519") {
     return { code: "unsupportedSignatureAlgorithm", detail: algorithm };
   }
-  if (signature.length === 0 || decodeBase64Url(signature) === null) {
-    return { code: "malformedSignature" };
-  }
-  if (!trustedKeys.keysById.has(keyId)) {
+  const signatureBytes = signature.length === 0 ? null : decodeBase64Url(signature);
+  if (signatureBytes === null) return { code: "malformedSignature" };
+  const key = trustedKeys.keysById.get(keyId);
+  // A malformed key in our own trust store is "cannot verify with this key", not a hard
+  // failure, so one bad entry does not disable a rotation set (the iOS rule).
+  if (key === undefined || key.length !== ED25519_PUBLIC_KEY_BYTES) {
     return { code: "unknownKeyId", detail: keyId };
   }
 
-  // The primitive gap, made explicit: the payload bytes are deliberately unused beyond this
-  // point until M4 supplies the algorithm.
-  return { code: "badSignature" };
+  const subtle = globalThis.crypto?.subtle;
+  if (subtle === undefined) return { code: "signatureUnverifiable", detail: "no crypto.subtle" };
+  let valid: boolean;
+  try {
+    // Copies: WebCrypto wants views over a plain ArrayBuffer, and these may be subarrays.
+    const cryptoKey = await subtle.importKey(
+      "raw",
+      new Uint8Array(key),
+      { name: "Ed25519" },
+      false,
+      ["verify"],
+    );
+    valid = await subtle.verify(
+      "Ed25519",
+      cryptoKey,
+      new Uint8Array(signatureBytes),
+      new Uint8Array(payloadBytes),
+    );
+  } catch (error: unknown) {
+    // NotSupportedError on a browser without Ed25519; anything else is the same answer.
+    const name = error instanceof Error ? error.name : "unknown";
+    return { code: "signatureUnverifiable", detail: name };
+  }
+  return valid ? null : { code: "badSignature" };
 }
 
 /**

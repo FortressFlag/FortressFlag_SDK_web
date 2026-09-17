@@ -29,6 +29,15 @@ and none of them reach your code as an error. Resolution order (the fail-safe ca
   reliable `appVersion`/`appBuild`/`osVersion` for a page, so those built-ins do not exist on
   web — a targeting rule on `appVersion` simply never matches a browser, by the contract's
   absent-tag semantics. That is documented behaviour, not a bug.
+- **Every payload is signature-verified in the browser** (Ed25519 over the exact bytes,
+  backend ADR-0025) against the production key shipped in the SDK, so a compromised network or
+  CDN cannot feed your page values FortressFlag did not sign; the cache is stored signed and
+  re-verified on load. Verification uses WebCrypto, which needs **Safari 17+, Chrome 137+ or
+  Firefox 130+**. A browser without WebCrypto Ed25519 — or an insecure non-localhost origin,
+  where `crypto.subtle` does not exist — cannot verify at all: the SDK reports
+  `signatureUnverifiable` once at error and keeps serving cached values and your defaults
+  rather than clearing anything. Local development against a backend running without signing
+  keys uses `signaturePolicy: SIGNATURE_DISABLED` explicitly.
 - **Ad blockers and privacy extensions** may block requests to flag domains. The cascade
   already answers: cached values keep serving, and a browser that never fetched serves your
   defaults. "Flags don't update with uBlock enabled" is that, not an SDK bug.
