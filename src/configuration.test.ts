@@ -80,9 +80,19 @@ describe("validateConfiguration", () => {
   it("reports required signing with no trusted keys", () => {
     expect(
       validate({
-        signaturePolicy: signatureRequired(TrustedKeys.FORTRESSFLAG_PRODUCTION),
+        signaturePolicy: signatureRequired(new TrustedKeys({})),
       }).map((p) => p.code),
     ).toEqual(["signatureRequiredButNoTrustedKeys"]);
+  });
+
+  it("ships the production key: prod-2026-09-k1, a raw 32-byte Ed25519 public key", () => {
+    // The default policy is required-with-production (ADR-0025); an empty constant would
+    // make every real payload rejected. The value itself is pinned by the cross-check
+    // against the backend's published key, not here.
+    const key = TrustedKeys.FORTRESSFLAG_PRODUCTION.keysById.get("prod-2026-09-k1");
+    expect(key).toBeInstanceOf(Uint8Array);
+    expect(key?.length).toBe(32);
+    expect(validate({})).toEqual([]);
   });
 
   it("reports a refresh interval below the floor", () => {

@@ -63,9 +63,10 @@ export const FortressFlag = {
   /**
    * Starts the SDK. Safe to call during page setup.
    *
-   * Returns as soon as the durable cache has been read (synchronously — `localStorage`),
-   * so a flag read on the next line already sees the last values this browser had.
-   * Everything else — identity, network, polling — happens in the background. Calling it a
+   * Returns immediately. The durable cache is read synchronously but VERIFIED
+   * asynchronously (WebCrypto), so the last values this browser had land a moment after
+   * this call returns, before any network result; subscribe with [onChange] to learn when
+   * they do. Everything else — identity, network, polling — happens in the background. Calling it a
    * second time replaces the configuration cleanly: the old poll chain is cancelled, never
    * doubled (React StrictMode double-invoke and hot module reload both re-run init code,
    * and a doubled poll loop against the per-device rate limit becomes a 429 loop). Invalid
@@ -110,9 +111,6 @@ export const FortressFlag = {
     });
     client = newClient;
 
-    // Synchronous, before this function returns — see FlagClient.loadCacheIntoStore.
-    const restoredEtag = newClient.loadCacheIntoStore();
-
     // Marked started here rather than inside the client, so diagnostics.isStarted is true
     // the instant start returns.
     snapshots.update((s) => ({ ...s, isStarted: true }));
@@ -138,7 +136,9 @@ export const FortressFlag = {
       visibilityHandler = handler;
     }
 
-    newClient.start(restoredEtag);
+    // Kicks the cache restore (read now, verified asynchronously — see
+    // FlagClient.restoreCache) and the first poll, which awaits the restore.
+    newClient.start();
   },
 
   /** Stops polling. Values already resolved keep resolving from memory and cache. */

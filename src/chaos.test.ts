@@ -177,7 +177,7 @@ describe("chaos", () => {
     const hostile = hostileResponses();
     const flagClient = client(new ScriptedApi(hostile), cache, store);
 
-    flagClient.loadCacheIntoStore();
+    await flagClient.restoreCache();
 
     for (let i = 0; i < hostile.length; i++) {
       // Whatever happened, it was reported as an outcome and not raised.
@@ -232,7 +232,7 @@ describe("chaos", () => {
     const flagClient = client(new ScriptedApi(signedShapes), cache, store, {
       signaturePolicy: signatureRequired(new TrustedKeys({ k1: new Uint8Array(32) })),
     });
-    flagClient.loadCacheIntoStore();
+    await flagClient.restoreCache();
 
     for (let i = 0; i < signedShapes.length; i++) {
       const outcome = await flagClient.refresh();
@@ -253,7 +253,7 @@ describe("chaos", () => {
 
     // No identity, so the device check is skipped and the cache still serves — the whole
     // point of making the check optional.
-    flagClient.loadCacheIntoStore();
+    await flagClient.restoreCache();
     expect(store.current.cached?.get("dark-mode")).toEqual({ kind: "boolean", value: true });
 
     const outcome = await flagClient.refresh();
