@@ -1,8 +1,9 @@
 {
   "name": "@fortressflag/sdk-web",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "FortressFlag web client SDK \u2014 zero-dependency TypeScript, fail-safe flag resolution for a single browser context",
   "private": true,
+  "license": "Apache-2.0",
   "type": "module",
   "packageManager": "pnpm@11.17.0",
   "engines": {
@@ -20,6 +21,7 @@
     "dist"
   ],
   "scripts": {
+    "prepare": "tsc -p tsconfig.build.json",
     "build": "tsc -p tsconfig.build.json && node scripts/size-gate.mjs",
     "lint": "prettier --check . && eslint .",
     "format": "prettier --write .",

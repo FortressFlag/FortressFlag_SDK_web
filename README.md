@@ -4,6 +4,9 @@ FortressFlag's web client SDK — zero-dependency TypeScript, fail-safe flag res
 single browser context (backend ADR-0014). It implements the contracts published in
 [`FortressFlag_Standards`](https://github.com/FortressFlag/FortressFlag_Standards).
 
+> **ADR-nnnn** refers to FortressFlag's internal architecture decision records. The public
+> contract every SDK implements is `FortressFlag_Standards`; decision records are not published.
+
 ## The promise
 
 **No call in this API throws, and no promise from it rejects.** A FortressFlag outage, a dead
