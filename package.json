@@ -34,10 +34,10 @@
     "@vitest/browser": "^3.2.7",
     "esbuild": "0.28.2",
     "eslint": "^9.17.0",
-    "playwright": "1.62.0",
-    "prettier": "^3.4.2",
+    "playwright": "1.63.0",
+    "prettier": "^3.9.8",
     "typescript": "^5.7.2",
-    "typescript-eslint": "^8.18.1",
+    "typescript-eslint": "^8.70.1",
     "vitest": "^3.2.7"
   }
 }
